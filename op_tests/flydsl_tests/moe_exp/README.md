@@ -13,27 +13,43 @@ below were measured there.
 
 ## The benchmark
 
-`run_a4w4_conc6144.sh` (repository root): one DeepSeek-R1 MoE layer at prefill, timed kernel by kernel.
+`run_a4w4_conc6144.sh` (repository root): one DeepSeek-R1 MoE layer at prefill, timed kernel by kernel. Since
+2026-11-02 the kit's default differs from that script in three ways, to study gemm1 alone:
+
+| | Default since 2026-11-02 | Before (= `run_a4w4_conc6144.sh`) |
+|---|---|---|
+| Tokens (`MOE_EXP_TOKENS`) | **2048**: 2048 x 8 = 16,384 routed rows, **256 per expert = one full M tile**, no masked rows | 1536: 12,288 routed rows, 192 per expert (rows 192-255 of each tile masked) |
+| Timed kernels (`MOE_EXP_KERNELS`) | **gemm1** | quant_a1, gemm1, gemm2 |
+| Inputs (`MOE_EXP_ROTATE`, `MOE_EXP_ROTATE_A`) | **4 rotating copies** of W1 + scales: every launch reads the experts' weights from HBM (`MOE_EXP_ROTATE_A=1` rotates A + scales too) | one copy, reused by every launch |
+
+The test still runs the whole MoE once and checks it against its torch reference; untimed kernels print
+`us = nan` and a "timing unavailable" warning. `MOE_EXP_TOKENS=1536 MOE_EXP_KERNELS=all MOE_EXP_ROTATE=1` is the
+earlier benchmark.
 
 | | |
 |---|---|
-| Shape | 64 experts, 1536 tokens, top-8 routing, model_dim 7168, inter_dim 2048 |
-| Routing | balanced (`AITER_MOE_EXPERT_BALANCE=true`): 1536 x 8 = 12,288 routed rows, 192 per expert |
+| Shape | 64 experts, 2048 tokens (default), top-8 routing, model_dim 7168, inter_dim 2048 |
+| Routing | balanced (`AITER_MOE_EXPERT_BALANCE=true`): token *t* goes to experts 8*t* .. 8*t*+7 (mod 64), so every expert gets tokens x 8 / 64 rows |
 | Data | MXFP4 activations and weights (E8M0 scale per 32 elements), SiLU, no bias |
-| quant_a1 | MXFP4 quant of the 1536 x 7168 activations and their scatter into the per-expert, preshuffled A of gemm1 (two kernels) |
-| gemm1 | per expert 192 x 4096 x 7168 (gate + up), epilogue SiLU + MXFP4 quant of the 192 x 2048 result |
-| gemm2 | per expert 192 x 7168 x 2048, bf16 output per route (gather-reduce sums each token's 8 routes) |
-| Config | token bucket 2048 of `aiter/configs/tuned_grouped_fmoe.csv`: tile 256x256x256, 2x2 waves, 4 LDS stages, 1x4 cluster; A layout and B load hint from the CSV |
+| quant_a1 | MXFP4 quant of the tokens x 7168 activations and their scatter into the per-expert, preshuffled A of gemm1 (two kernels) |
+| gemm1 | per expert 256 x 4096 x 7168 (gate + up), epilogue SiLU + MXFP4 quant of the 256 x 2048 result |
+| gemm2 | per expert 256 x 7168 x 2048, bf16 output per route (gather-reduce sums each token's 8 routes) |
+| Config | token bucket 2048 of `aiter/configs/tuned_grouped_fmoe.csv` (1536 rounds up to the same row): tile 256x256x256, 2x2 waves, 4 LDS stages, 1x4 cluster; A preshuffled and B load hint 1 from the CSV. gemm1 and gemm2 are two specializations of one FlyDSL kernel (`launch_gemm_a8w4_tdm`), with the same tile settings |
 | Schedule (env) | `AITER_FLYDSL_MMA_FIRST_GROUP=4 AITER_FLYDSL_MMA_GROUP=4 AITER_FLYDSL_DS_FIRST_N=8` (`mg4_dsfirst8` in the kernel names; 2489bae2d ran `mg1x2_dsfirst16`) |
 
 How the work maps onto the GPU (one workgroup per WGP; the LDS stages leave no room for a second):
 
-- gemm1 launches a worst-case grid of 112 M tiles x 16 N tiles. M tile *e* is expert *e*'s 192 rows; the other
-  48 M tiles have no rows and exit at once. So 1024 workgroups do work, about 4 rounds over the 256 WGPs.
+- gemm1 launches a worst-case grid of M tiles x 16 N tiles: 128 M tiles at 2048 tokens (112 at 1536). M tile *e*
+  holds expert *e*'s rows (each expert starts on a 256-row boundary); the other 64 (48) M tiles have no rows and
+  exit at once. So 1024 workgroups do work, about 4 rounds over the 256 WGPs.
 - Each workgroup computes one 256 x 256 output tile of one expert. The 16 workgroups of an expert read the same A
-  (192 rows x 7168; the 1x4 cluster multicasts it, the four clusters share it through L2). Each reads its own 256
-  columns of the expert's W1 (896 KB), so **no weight byte is read twice**.
+  (256 rows x 7168; the 1x4 cluster multicasts it, the four clusters share it through L2). Each reads its own 256
+  columns of the expert's W1 (896 KB), so **no weight byte is read twice** within a launch.
 - gemm2: 64 experts x 28 N tiles = 1792 working workgroups (about 7 rounds), 8 K tiles each.
+- Partial tiles (192 rows per expert at 1536 tokens): the A load's row extent is clamped to the expert's rows
+  (TDM fills the rest of the LDS tile with zeros instead of reading it, per the kernel's comments), every WMMA still
+  runs (25% of them on zero rows), gemm1's SiLU + quant skips 16-row blocks past the last row, and the TDM store
+  writes only the valid rows. At 256 rows per expert the clamp equals the tile.
 
 Kernels (names from the FlyDSL dump):
 `a8w4_tdm_fp4_apre_t256x256x256_w2x2_b4_K7168_e64_act1_q1r8_cluster1x4_prefetch_bth1_wpt1_mg4_dsfirst8_regpart_planarlds_interleavelds_rolleddrain`
@@ -76,36 +92,66 @@ site and JIT-builds into it.
 From the repository root:
 
 ```bash
-SITE=$PWD/../moe_exp_site op_tests/flydsl_tests/moe_exp/bench.sh            # Yan's benchmark, 3 timed rounds
+SITE=$PWD/../moe_exp_site op_tests/flydsl_tests/moe_exp/bench.sh            # gemm1, 2048 tokens, rotating; 3 rounds
 # on a shared node: lock every GPU process; inside the lock check the GPU is idle before each process
 LOCK=gpu-lock IDLE_CHECK=1 SITE=... op_tests/flydsl_tests/moe_exp/bench.sh 5
 # interleaved A/B: variant = name:ENV=VAL,ENV=VAL on top of run_a4w4_conc6144.sh's environment
-SITE=... op_tests/flydsl_tests/moe_exp/bench.sh 3 base bth0:AITER_TDM_B_TH=0 c44:AITER_FLYDSL_MXFP4_CLUSTER_M=4
+SITE=... op_tests/flydsl_tests/moe_exp/bench.sh 3 base bth0:AITER_TDM_B_TH=0 rot1:MOE_EXP_ROTATE=1
+# the earlier benchmark: Yan's shape, all three kernels, no rotation
+MOE_EXP_TOKENS=1536 MOE_EXP_KERNELS=all MOE_EXP_ROTATE=1 SITE=... op_tests/flydsl_tests/moe_exp/bench.sh 5
+# counter mode: HBM read bytes per gemm1 launch (rocprofv3 --pmc, public GL2C counters; no timing).
+# Not proven: its only run hung the node, see below before using it.
+PMC_ROCPROF=$VENV/bin/rocprofv3 LOCK=gpu-lock IDLE_CHECK=1 SITE=... op_tests/flydsl_tests/moe_exp/bench.sh 1 rot4 rot1:MOE_EXP_ROTATE=1
 ```
 
 Each (variant, round) is one process running `op_tests/flydsl_tests/test_flydsl_grouped_gemm.py` with
-`run_a4w4_conc6144.sh`'s environment and arguments, through `bench_driver.py`. Round 0 is a warm-up/compile round
+`run_a4w4_conc6144.sh`'s environment and arguments (tokens from `MOE_EXP_TOKENS`), through `bench_driver.py`. Round 0 is a warm-up/compile round
 and is not counted. Results go to `moe_exp_runs/<UTC time>/` (or `OUT`): `meta.txt` (node, boot time, versions,
 MEC/PM firmware, clock, power cap), one log per process, `out/*.pt` (outputs), `dump-<variant>/` (FlyDSL IR, named
 after the kernels), and `summary.txt` from `summarize.py`. With `IDLE_CHECK=1` a process runs only if, inside the
 lock, `rocm-smi` shows 0% GPU use and less than `IDLE_VRAM_MB` (1024) MB of VRAM in use; otherwise the series
 stops. The VRAM check catches a loaded but idle model server, which shows 0% use.
 
+Counter mode (`PMC_ROCPROF` = a rocprofv3 matching the venv's ROCm) runs each process under
+`rocprofv3 --pmc GL2C_EA_RDREQ GL2C_EA_RDREQ_128B GL2C_READ_SECTORS GL2C_REQ` and replaces all timing with
+`MOE_EXP_PMC_LAUNCHES` (8) spaced launches (synchronize + 2 ms idle before each) of gemm1, rotating as configured,
+after a control of 4 copies of 1 GiB that is not in L2. `pmc_hbm.py` (run at the end, `pmc_summary.txt`) converts
+`GL2C_EA_RDREQ` to bytes with the control's bytes per request and compares each launch with the input bytes. The
+GL2C counters count without the XCD counter-clock register (they sit on the AID).
+
+**This mode has never finished, and `pmc_hbm.py` has never read real output.** Its only run (2026-11-02 02:44 UTC,
+d01-3, with the BPC23 voltage offset active) hung the node within about 2 minutes, during the first process's compile.
+Every reader of the driver's power-management lock froze, including other users' tools, later dmesg showed
+`SMU: No response`, and the node needed a power cycle. The cause is not proven. rocprofv3's preload also loads its tool
+into FlyDSL's `ld.lld` child processes (each process compiles its kernels, so this happens in every process), and one of
+those children was among the frozen tasks. On a shared node, ask before running it.
+
 ## What is measured
 
-The test's kernel-bench times three launch callables, in this order: `quant_a1`, `gemm1`, `gemm2`. Each callable
-is the Python launcher bound to one eager run's tensors, so calling it re-launches that stage on the same buffers.
+The test's kernel-bench has three launch callables, in this order: `quant_a1`, `gemm1`, `gemm2`. Each callable
+is the Python launcher bound to one eager run's tensors, so calling it re-launches that stage. `bench_driver.py`
+times only the kernels in `MOE_EXP_KERNELS` (default gemm1) and wraps each timed GEMM in a rotating launcher:
+
+- **Rotation** (`MOE_EXP_ROTATE`, default 4): copy *i* of {W, W scales} serves launches *i*, *i*+4, *i*+8, ... Each
+  copy holds a full copy of the buffer's storage (same offset and strides), so every copy feeds the kernel identical
+  bytes and the outputs stay bit-identical. Between two uses of a copy the other three copies (1 GB of storage each at
+  2048 tokens) stream through L2, far more than it holds (a 64 MiB ring stays resident in one AID's L2, 128 MiB does
+  not: 2026-10-24 latency ladder), so every launch should read its weights from HBM. That is from these sizes and from
+  timing (8 copies time the same as 4, see the results), not from counters. `MOE_EXP_ROTATE_A=1` rotates A and its
+  scales the same way (A is still reused inside a launch, 16 N tiles per expert); `MOE_EXP_ROTATE=1` reuses one set of
+  buffers, as before 2026-11-02. Both timers below rotate.
 
 - **profiler_us**: the test's own number. For each callable AITER's `run_perftest(testGraph=False)` makes 5 warm-up
-  calls, then 128 calls with no synchronization in between inside the torch profiler, and averages the kernels'
-  device durations from the trace (first iteration and outliers outside 1.5 IQR dropped; a two-kernel callable
-  like `quant_a1` reports the sum). The callables pass no tensor arguments, so `run_perftest`'s input rotation
-  does nothing: every launch reads the same inputs and writes the same outputs. The test prints gemm1 and gemm2;
-  `bench_driver.py` prints all three (`[moe-exp] <name>: profiler_us`), from the same values. If it prints
+  calls, then (with `AITER_LOG_MORE=1`) 128 synchronized calls timed with events (logged, not used), then 128
+  calls with no synchronization in between inside the torch profiler, and averages the kernels' device durations
+  from the trace (first iteration and outliers outside 1.5 IQR dropped; a two-kernel callable like `quant_a1`
+  reports the sum). The callables pass no tensor arguments, so `run_perftest`'s own input rotation does nothing;
+  `bench_driver.py`'s rotating launcher does the rotation. `bench_driver.py` prints each timed kernel's value as
+  `[moe-exp] <name>: profiler_us`. If it prints
   `n/a` (the test: `us = nan`), the profiler trace had no kernel events; `profiler_probe.py` checks whether the
   node's torch profiler records kernels at all (on d01-3 it stopped after warm reboots; see the 2026-11-01 results).
-- **graph_us**: after the test has timed all three callables, `bench_driver.py` captures each callable 128 times
-  into one CUDA graph, replays it 10 times, and times each replay with CUDA events: the median time per launch.
+- **graph_us**: after the test's timing, `bench_driver.py` captures each timed callable 128 times (a multiple of
+  the rotation count, so the copies keep their order across replays) into one CUDA graph, replays it 10 times, and times each replay with CUDA events: the median time per launch.
   No profiler; launches run back to back and the number includes the ~1.5 us gaps between kernels. The GPU idles
   1 s before each callable's graph timing (`MOE_EXP_GRAPH_GAP_S`), so one kernel's back-to-back run does not heat
   the GPU for the next kernel.
@@ -113,8 +159,8 @@ is the Python launcher bound to one eager run's tensors, so calling it re-launch
   and raises otherwise; `summarize.py` also compares every saved output bit for bit with the first variant's
   round-1 output.
 - **TB/s**: bytes / time, each byte counted once (`summarize.py`): gemm1 = A + W1 + MXFP4 output, each with its
-  E8M0 scales = 1,058.4 MB; gemm2 = A2 + W2 (+ scales) + bf16 output = 688.7 MB. The test's own "Bandwidth"
-  counts gemm1's output as bf16 (1,095.3 MB), the grouped-MoE tuner's convention.
+  E8M0 scales = 1,078.5 MB at 2048 tokens (1,058.4 MB at 1536); gemm2 = A2 + W2 (+ scales) + bf16 output = 688.7 MB
+  at 1536 tokens. The test's own "Bandwidth" counts gemm1's output as bf16, the grouped-MoE tuner's convention.
 
 Why the two timers differ. They time different launch regimes, and only one of them traces:
 - The Python launch path takes about 190 us per call (the `AITER_LOG_MORE` event lines: ~272 us per synchronized
@@ -136,6 +182,36 @@ Clocks, power limits and firmware matter: a node whose perf settings were not re
 5-20% slow. After a reboot also run `profiler_probe.py`: if it gets no events, profiler_us stays n/a on that boot.
 
 ## Results
+
+### 2026-11-02, gemm1 at 2048 tokens with rotation, heliosr-1b114-d01-3 (MI450X), at 8ea2265dc, MEC 2430, BPC23 perf setup applied
+
+`results/20261102_d01-3_mec2430_bpc23_g1rot/` (meta.txt, summary.txt, run_log.txt, one full process log,
+series1_summary.txt, profiler_probe.txt). 5 timed rounds, one process each, interleaved, 17:59-18:11 UTC. Command with
+the kit's current defaults: `LOCK=gpu-lock IDLE_CHECK=1 SITE=... op_tests/flydsl_tests/moe_exp/bench.sh 5
+rot4a:MOE_EXP_ROTATE_A=1 rot8a:MOE_EXP_ROTATE=8,MOE_EXP_ROTATE_A=1 rot4 rot1:MOE_EXP_ROTATE=1`. In the saved files
+A rotation was still the default, so these variants are named `rot4`, `rot8`, `rot4w` and `rot1`.
+
+| Inputs rotated | profiler_us (median, range) | graph_us (median, range) | TB/s (profiler) | TB/s (graph) | graph_us vs none |
+|---|---|---|---|---|---|
+| None | 78.31 (77.62-79.22) | 78.39 (78.25-78.54) | 13.77 | 13.76 | - |
+| **Weights, 4 copies (default)** | **82.06** (81.11-82.49) | **82.06** (82.04-82.18) | **13.14** | **13.14** | +4.7% |
+| Weights + A, 4 copies | 83.23 (82.87-83.73) | 84.38 (84.17-84.66) | 12.96 | 12.78 | +7.6% |
+| Weights + A, 8 copies | 83.63 (83.06-85.08) | 84.34 (84.30-84.49) | 12.90 | 12.79 | +7.6% |
+
+- Node state: boot 2026-11-02 14:24 UTC after a power cycle; MEC firmware 2430, PM 02.125.15.00, MAX_CLK 2400 MHz,
+  2.5 kW socket power limit. `perf_setup_BPC23.sh` applied at 16:02 UTC: voltage offset -82 mV, CSC DVO offset 25 mV, CPU
+  governor performance, NUMA balancing off, amdgpu default parameters. REALTIME - KFD clock +0.017 ms;
+  `profiler_probe.py`: 256 of 256 events.
+- Correct in every round (`logits_diff=3.4257e-06`, `rel_l2=2.6175e-03`); all 24 outputs bit-identical.
+- A separate series (17:53-17:58 UTC, `series1_summary.txt`) reproduces weights + A, 4 copies (profiler 84.06, graph
+  84.27) and no rotation (profiler 77.47, graph 78.38).
+- 8 copies time the same as 4 (graph -0.05%), so more distance between two uses of a copy gains nothing: 4 copies leave
+  nothing reusable behind. This is timing evidence. HBM read bytes were not counted, because counter mode hung the node
+  (see Running).
+- Without rotation, launches are 3.7 us faster from reused weights and another 2.3 us from reused A (graph_us).
+  Probably data left in L2 by the previous launch; inferred from timing.
+- Against the same kernels at 1536 tokens without rotation (74.96 us, 14.12 TB/s on 2026-11-01; another boot, so a rough
+  comparison), 2048 tokens without rotation takes 4.6% longer for 1.9% more bytes.
 
 ### 2026-11-02, heliosr-1b114-d01-3 (MI450X), at 8ea2265dc, MEC 2430, BPC23 perf setup applied
 

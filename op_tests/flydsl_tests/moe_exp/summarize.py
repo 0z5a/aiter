@@ -2,7 +2,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Summarize a bench.sh output directory.
 
-Per variant: median quant_a1/gemm1/gemm2 time over the timed rounds (round 0 is
+Per variant: median time of each timed kernel (meta.txt ``kernels``; runs before
+2026-11-02 timed quant_a1, gemm1 and gemm2) over the timed rounds (round 0 is
 warm-up), for both timers (``profiler_us`` = the test's kernel-bench, ``graph_us`` =
 bench_driver.py's CUDA-graph timer), TB/s from the byte model below (gemm1 and
 gemm2 only; quant_a1 is two kernels, the A quant and its scatter), the test's
@@ -16,6 +17,7 @@ active, MXFP4 = 0.5 B per element plus one E8M0 byte per 32 elements):
   gemm2  A2 (R x inter) + scales, W2 (E x model_dim x inter) + scales,
          output R x model_dim bf16 (one row per route, before gather-reduce)
 The test's own "Bandwidth" counts gemm1's output as bf16 instead ("test GB/s").
+With rotation (meta.txt ``rotation``) every one of these bytes comes from HBM.
 
 usage: python summarize.py <bench.sh OUT directory>
 """
@@ -59,6 +61,11 @@ def main(d):
     names = re.search(r"^variants\s+(.*)$", meta, re.MULTILINE).group(1).split()
     names = [n.split(":")[0] for n in names]
     nbytes = byte_model(args)
+    km = re.search(r"^kernels\s+(\S+)", meta, re.MULTILINE)
+    kernels = ("quant_a1", "gemm1", "gemm2")
+    if km and km.group(1) != "all":
+        kernels = tuple(k for k in kernels if k in km.group(1).split(","))
+        nbytes = {k: v for k, v in nbytes.items() if k in kernels}
     print(meta.rstrip())
     print()
     print(
@@ -77,7 +84,7 @@ def main(d):
             key=lambda p: int(re.search(r"_r(\d+)\.log$", p).group(1)),
         )
         timed = [p for p in logs if not p.endswith("_r0.log")]
-        for k in ("quant_a1", "gemm1", "gemm2"):
+        for k in kernels:
             for timer, pat in (
                 # bench_driver.py prints every kernel; the test prints gemm1/gemm2 only
                 ("profiler", rf"\[moe-exp\] {k}: profiler_us = ([0-9.]+)|\] {k}: us = ([0-9.]+)"),
