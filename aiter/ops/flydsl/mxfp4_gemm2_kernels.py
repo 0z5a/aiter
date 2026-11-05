@@ -46,6 +46,7 @@ def _get_compiled_mxfp4_gemm2_port(
     xcd_swizzle=0,
     num_xcds=8,
     num_cu=256,
+    use_valid_token_count=False,
 ):
     from .kernels.mxfp4_gemm2 import compile_gemm2_a4w4_port
 
@@ -62,6 +63,7 @@ def _get_compiled_mxfp4_gemm2_port(
         xcd_swizzle=xcd_swizzle,
         num_xcds=num_xcds,
         num_cu=num_cu,
+        use_valid_token_count=use_valid_token_count,
     )
 
 
@@ -133,6 +135,7 @@ def flydsl_mxfp4_gemm2(
     xcd_swizzle=0,
     num_xcds=None,
     num_cu=None,
+    use_valid_token_count=False,
     stream=None,
 ):
     _assert_supported(
@@ -162,6 +165,7 @@ def flydsl_mxfp4_gemm2(
         xcd_swizzle,
         get_num_xcds() if num_xcds is None else num_xcds,
         get_cu_num() if num_cu is None else num_cu,
+        use_valid_token_count,
     )
 
     max_m_blocks = (max_sorted + BM - 1) // BM
